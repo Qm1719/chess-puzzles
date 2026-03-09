@@ -1,15 +1,15 @@
 """
 Fetch a Chess Ranger / Solo Chess board from puzzle-chess.com and return FEN.
 
-Differences from v2: keep the same overall scraping approach but refine the DOM/JavaScript extraction strategies,
-  improve robustness for multiple board layouts, and standardize the output file so it can be reused across solver
-  versions and modes.
+Differences from v3: specialize this fetcher for exporting Solo Chess boards into a dedicated
+  `solo-chess-boards.fen` file, while keeping the Playwright-based extraction pipeline so the
+  new multi-mode solver can load large Solo datasets directly.
 
 Usage:
   pip install playwright
   python -m playwright install chromium   # or: firefox, webkit
 
-  python fetch_puzzle_chess.py "https://www.puzzle-chess.com/chess-ranger-4/"
+  python fetch_puzzle_chess.py "https://www.puzzle-chess.com/solo-chess-4/"
   python fetch_puzzle_chess.py   # uses default 4-piece URL
   BROWSER=firefox python fetch_puzzle_chess.py   # use Firefox instead of Chromium
 
@@ -22,7 +22,7 @@ import os
 import sys
 import time
 
-DEFAULT_DATAFILE = "puzzle_chess_boards.fen"
+DEFAULT_DATAFILE = "solo-chess-boards.fen"
 
 # Map Unicode piece symbols (white/black) to FEN letter
 SYMBOL_TO_FEN = {
@@ -310,7 +310,7 @@ def fetch_board_from_url(url, wait_sec=4.0):
     return (fen, piece_count) if fen else (None, 0)
 
 
-BASE_URL = "https://www.puzzle-chess.com/chess-ranger-{size}/"
+BASE_URL = "https://www.puzzle-chess.com/solo-chess-{size}/"
 
 
 def crawl_boards(per_size=100, out_path=None, wait_sec=4.0, delay_between=1.0):
@@ -367,7 +367,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Fetch Chess Ranger boards from puzzle-chess.com; print FEN and optionally append to a data file."
     )
-    parser.add_argument("url", nargs="?", default="https://www.puzzle-chess.com/chess-ranger-4/", help="Page URL to fetch")
+    parser.add_argument("url", nargs="?", default="https://www.puzzle-chess.com/solo-chess-4/", help="Page URL to fetch")
     parser.add_argument("-o", "--out", metavar="FILE", default=None,
         help=f"Append FEN to this file (default: {DEFAULT_DATAFILE})")
     parser.add_argument("--no-file", action="store_true", help="Do not write to any data file")
