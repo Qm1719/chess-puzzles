@@ -1,8 +1,6 @@
 """
-Solitaire Chess Solver v4 — pure DFS and A* (Wikipedia/textbook).
-Differences from v3: extend the single-variant model into three game modes (Ranger, Melee, Solo) with colored
-  pieces and side-to-move, add per-piece move limits for Solo, split the logic into dedicated solver classes for
-  each mode, and introduce per-mode benchmarks and .fen loaders for large-scale testing.
+Solitaire Chess Solver v5 — pure DFS and A* (Wikipedia/textbook).
+Improvements: compact state key, strictly admissible heuristic + tie-break, goal-on-generation.
 """
 import heapq
 import os
@@ -13,8 +11,30 @@ import time
 import tracemalloc
 
 # --- FEN (piece placement only): rank8/rank7/.../rank1, a-h left to right ---, uppercase for white, lowercase for black
-FEN_TO_NAME = {'K': 'King', 'Q': 'Queen', 'R': 'Rook', 'B': 'Bishop', 'N': 'Knight', 'P': 'Pawn', 'k': 'Black King', 'q': 'Black Queen', 'r': 'Black Rook', 'b': 'Black Bishop', 'n': 'Black Knight', 'p': 'Black Pawn'}
-NAME_TO_FEN = {v: k for k, v in FEN_TO_NAME.items()}
+FEN_TO_NAME = {'K': 'King', 'Q': 'Queen', 'R': 'Rook', 'B': 'Bishop', 'N': 'Knight', 'P': 'Pawn', 'k': 'King', 'q': 'Queen', 'r': 'Rook', 'b': 'Bishop', 'n': 'Knight', 'p': 'Pawn'}
+NAME_TO_FEN = {
+    ('King', 'white'): 'K',
+    ('Queen', 'white'): 'Q',
+    ('Rook', 'white'): 'R',
+    ('Bishop', 'white'): 'B',
+    ('Knight', 'white'): 'N',
+    ('Pawn', 'white'): 'P',
+    ('King', 'black'): 'k',
+    ('Queen', 'black'): 'q',
+    ('Rook', 'black'): 'r',
+    ('Bishop', 'black'): 'b',
+    ('Knight', 'black'): 'n',
+    ('Pawn', 'black'): 'p',
+}
+
+# For move text (SAN-like). Independent from NAME_TO_FEN (which is keyed by (name,color)).
+PIECE_NAME_TO_SAN = {
+    'King': 'K',
+    'Queen': 'Q',
+    'Rook': 'R',
+    'Bishop': 'B',
+    'Knight': 'N',
+}
 
 
 def fen_to_pieces(fen: str):
@@ -29,8 +49,8 @@ def fen_to_pieces(fen: str):
         for c in rank:
             if c.isdigit():
                 col += int(c)
-            elif c.upper() in FEN_TO_NAME:
-                name = FEN_TO_NAME[c.upper()]
+            elif c in FEN_TO_NAME:
+                name = FEN_TO_NAME[c]
                 color = 'white' if c.isupper() else 'black'
                 pieces.append(Piece(name, row, col, color))
                 col += 1
@@ -46,7 +66,7 @@ def pieces_to_fen(pieces):
     grid = [[''] * 8 for _ in range(8)]
     for p in pieces:
         if 0 <= p.row < 8 and 0 <= p.col < 8:
-            grid[p.row][p.col] = NAME_TO_FEN[p.name]
+            grid[p.row][p.col] = NAME_TO_FEN[(p.name, p.color)]
     rows = []
     for r in range(8):
         s = ''
@@ -66,6 +86,7 @@ def pieces_to_fen(pieces):
 
 
 def move_description_to_san(desc):
+    # print(desc)
     """Convert 'Rook (e5) -> Knight (f5)' to conventional 'Re5xf5'. Pawn: 'exd5'."""
     if not desc or desc == "Start":
         return None
@@ -75,7 +96,7 @@ def move_description_to_san(desc):
     piece_name, from_sq, to_sq = m.group(1), m.group(2), m.group(3)
     if piece_name == "Pawn":
         return from_sq[0] + " x " + to_sq
-    letter = NAME_TO_FEN.get(piece_name, "?")
+    letter = PIECE_NAME_TO_SAN.get(piece_name, "?")
     return letter + from_sq + " x " + to_sq
 
 
@@ -229,381 +250,153 @@ class BoardState:
 
 # --- Solver: pure DFS and A* ---
 class RangerSolver:
-    def get_solution_path(self, end_state):
-        path = []
-        current = end_state
-        while current:
-            path.append(current)
-            current = current.parent
-        return path[::-1]
-
-    def heuristic(self, state):
-        """Admissible: minimum remaining captures = pieces - 1."""
-        return len(state.pieces) - 1
-
-    @staticmethod
-    def _h_and_center(state):
-        """Single pass: (h, center_sum) for A* and tie-breaking. Avoids two iterations over pieces."""
-        n = len(state.pieces)
-        h = n - 1
-        c = sum(abs(p.row - 3.5) + abs(p.col - 3.5) for p in state.pieces)
-        return h, c
+    """
+    - Pieces move as standard chess pieces.
+    - You can perform only capture moves.
+    - You are allowed to capture the king.
+    - The goal is to end up with one single piece on the board.
+    """
+    def _ranger_next_states(self, state):
+        return state.get_ranger_legal_moves()
 
     def solve_dfs(self, initial_state):
-        """Pure DFS: stack, visited set. Goal checked when expanding (faster than on every child)."""
-        stack = [initial_state]
-        visited = {initial_state.state_key()}
-        while stack:
-            curr = stack.pop()
-            if curr.is_goal():
-                return self.get_solution_path(curr)
-            for child in curr.get_ranger_legal_moves():
-                key = child.state_key()
-                if key not in visited:
-                    visited.add(key)
-                    stack.append(child)
-        return None
+        return dfs(initial_state, self._ranger_next_states)
 
     def solve_astar(self, initial_state):
-        """Pure A*: f = g + h, admissible h. Tie-break: more-central first, then LIFO. Single-pass h+c."""
-        h0, c0 = self._h_and_center(initial_state)
-        push_order = 0
-        open_set = [(h0, h0, c0, -push_order, initial_state)]
-        push_order += 1
-        visited = {initial_state.state_key()}
-        while open_set:
-            _, _, _, _, curr = heapq.heappop(open_set)
-            if curr.is_goal():
-                return self.get_solution_path(curr)
-            for child in curr.get_ranger_legal_moves():
-                key = child.state_key()
-                if key not in visited:
-                    visited.add(key)
-                    h, c = self._h_and_center(child)
-                    f = child.g + h
-                    heapq.heappush(open_set, (f, h, c, -push_order, child))
-                    push_order += 1
-        return None
+        return astar(initial_state, self._ranger_next_states)
 
     def solve_with_metrics(self, initial_state, algorithm='dfs'):
         tracemalloc.start()
         t0 = time.perf_counter()
-        visited = {initial_state.state_key()}
-        nodes_explored = 0
-        solution_found = False
-        path_length = 0
+        tracked_metrics = [0, False, 0] # [nodes_explored, solution_found, path_length]
 
         if algorithm == 'dfs':
-            stack = [initial_state]
-            while stack:
-                curr = stack.pop()
-                nodes_explored += 1
-                if curr.is_goal():
-                    solution_found = True
-                    path_length = len(self.get_solution_path(curr)) - 1
-                    break
-                for child in curr.get_ranger_legal_moves():
-                    key = child.state_key()
-                    if key not in visited:
-                        visited.add(key)
-                        stack.append(child)
+            dfs(initial_state, self._ranger_next_states, with_metrics=True, tracked_metrics=tracked_metrics)
         else:
-            h0, c0 = self._h_and_center(initial_state)
-            push_order = 0
-            open_set = [(h0, h0, c0, -push_order, initial_state)]
-            push_order += 1
-            while open_set:
-                _, _, _, _, curr = heapq.heappop(open_set)
-                nodes_explored += 1
-                if curr.is_goal():
-                    solution_found = True
-                    path_length = len(self.get_solution_path(curr)) - 1
-                    break
-                for child in curr.get_ranger_legal_moves():
-                    key = child.state_key()
-                    if key not in visited:
-                        visited.add(key)
-                        h, c = self._h_and_center(child)
-                        f = child.g + h
-                        heapq.heappush(open_set, (f, h, c, -push_order, child))
-                        push_order += 1
+            astar(initial_state, self._ranger_next_states, with_metrics=True, tracked_metrics=tracked_metrics)
 
         t1 = time.perf_counter()
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         return {
             'algorithm': algorithm,
-            'success': solution_found,
+            'success': tracked_metrics[1],
             'time_sec': t1 - t0,
             'memory_peak_mb': peak / (1024 * 1024),
-            'nodes_explored': nodes_explored,
-            'path_length': path_length,
+            'nodes_explored': tracked_metrics[0],
+            'path_length': tracked_metrics[2],
         }
 
 class MeleeSolver:
     """
-    - 2 side chess game.
     - Pieces move as standard chess pieces.
-- White moves first.
-- You can perform only capture moves.
-- The goal is to end up with one single piece on the board.
+    - White moves first.
+    - You can perform only capture moves.
+    - The goal is to end up with one single piece on the board.
     """
-    def get_solution_path(self, end_state):
-        path = []
-        current = end_state
-        while current:
-            path.append(current)
-            current = current.parent
-        return path[::-1]
-    def heuristic(self, state):
-        """Admissible: minimum remaining captures = pieces - 1."""
-        return len(state.pieces) - 1
-    def _h_and_center(self, state):
-        """Single pass: (h, center_sum) for A* and tie-breaking. Avoids two iterations over pieces."""
-        n = len(state.pieces)
-        h = n - 1
-        c = sum(abs(p.row - 3.5) + abs(p.col - 3.5) for p in state.pieces)
-        return h, c
-    
+    def _melee_next_states(self, state):
+        # Generate children and flip side-to-move for melee.
+        children = []
+        for child in state.get_melee_legal_moves(state.turn):
+            child.turn = 'black' if state.turn == 'white' else 'white'
+            children.append(child)
+        return children
+
     def solve_dfs(self, initial_state):
-        """Pure DFS: stack, visited set. Goal checked when expanding (faster than on every child)."""
-        #white pieces move first, black pieces move second in order
         initial_state.turn = 'white'
-        stack = [initial_state]
-        visited = {initial_state.state_key()}
-        while stack:
-            curr = stack.pop()
-            if curr.is_goal():
-                return self.get_solution_path(curr)
-            for child in curr.get_melee_legal_moves(curr.turn):
-                child.turn = 'black' if curr.turn == 'white' else 'white'
-                key = child.state_key()
-                if key not in visited:
-                    visited.add(key)
-                    stack.append(child)
-        return None
+        return dfs(initial_state, self._melee_next_states)
 
     def solve_astar(self, initial_state):
-        """Pure A*: f = g + h, admissible h. Tie-break: more-central first, then LIFO. Single-pass h+c."""
-        #white pieces move first, black pieces move second in turn
         initial_state.turn = 'white'
-        h0, c0 = self._h_and_center(initial_state)
-        push_order = 0
-        open_set = [(h0, h0, c0, -push_order, initial_state)]
-        push_order += 1
-        visited = {initial_state.state_key()}
-        while open_set:
-            _, _, _, _, curr = heapq.heappop(open_set)
-            if curr.is_goal():
-                return self.get_solution_path(curr)
-            for child in curr.get_melee_legal_moves(curr.turn):
-                child.turn = 'black' if curr.turn == 'white' else 'white'
-                key = child.state_key()
-                if key not in visited:
-                    visited.add(key)
-                    h, c = self._h_and_center(child)
-                    f = child.g + h
-                    heapq.heappush(open_set, (f, h, c, -push_order, child))
-                    push_order += 1
-        return None
+        return astar(initial_state, self._melee_next_states)
     
     def solve_with_metrics(self, initial_state, algorithm='dfs'):
         tracemalloc.start()
         t0 = time.perf_counter()
         initial_state.turn = 'white'
-        visited = {initial_state.state_key()}
-        nodes_explored = 0
-        solution_found = False
-        path_length = 0
+        tracked_metrics = [0, False, 0] # [nodes_explored, solution_found, path_length]
 
         if algorithm == 'dfs':
-            #white pieces move first, black pieces move second in order
-            stack = [initial_state]
-            while stack:
-                curr = stack.pop()
-                nodes_explored += 1
-                if curr.is_goal():
-                    solution_found = True
-                    path_length = len(self.get_solution_path(curr)) - 1
-                    break
-                for child in curr.get_melee_legal_moves(curr.turn):
-                    child.turn = 'black' if curr.turn == 'white' else 'white'
-                    key = child.state_key()
-                    if key not in visited:
-                        visited.add(key)
-                        stack.append(child)
+            dfs(initial_state, self._melee_next_states, with_metrics=True, tracked_metrics=tracked_metrics)
         else:
-            initial_state.pieces.sort(key=lambda x: x.color) #white pieces move first, black pieces move second in order
-            h0, c0 = self._h_and_center(initial_state)
-            push_order = 0
-            open_set = [(h0, h0, c0, -push_order, initial_state)]
-            push_order += 1
-            while open_set:
-                _, _, _, _, curr = heapq.heappop(open_set)
-                nodes_explored += 1
-                if curr.is_goal():
-                    solution_found = True
-                    path_length = len(self.get_solution_path(curr)) - 1
-                    break
-                for child in curr.get_melee_legal_moves(curr.turn):
-                    child.turn = 'black' if curr.turn == 'white' else 'white'
-                    key = child.state_key()
-                    if key not in visited:
-                        visited.add(key)
-                        h, c = self._h_and_center(child)
-                        f = child.g + h
-                        heapq.heappush(open_set, (f, h, c, -push_order, child))
-                        push_order += 1
+            astar(initial_state, self._melee_next_states, with_metrics=True, tracked_metrics=tracked_metrics)
 
         t1 = time.perf_counter()
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         return {
             'algorithm': algorithm,
-            'success': solution_found,
+            'success': tracked_metrics[1],
             'time_sec': t1 - t0,
             'memory_peak_mb': peak / (1024 * 1024),
-            'nodes_explored': nodes_explored,
-            'path_length': path_length,
+            'nodes_explored': tracked_metrics[0],
+            'path_length': tracked_metrics[2],
         }
        
 class SoloSolver:
-    def get_solution_path(self, end_state):
-        path = []
-        current = end_state
-        while current:
-            path.append(current)
-            current = current.parent
-        return path[::-1]
-
-    def heuristic(self, state):
-        """Admissible: minimum remaining captures = pieces - 1."""
-        return len(state.pieces) - 1
-
-    @staticmethod
-    def _h_and_center(state):
-        """Single pass: (h, center_sum) for A* and tie-breaking. Avoids two iterations over pieces."""
-        n = len(state.pieces)
-        h = n - 1
-        c = sum(abs(p.row - 3.5) + abs(p.col - 3.5) for p in state.pieces)
-        return h, c
-
+    """
+    - Pieces move as standard chess pieces.
+    - You can perform only capture moves.
+    - You can move a piece only twice.
+    - You are NOT allowed to capture the king.
+    - The goal is to end up with one single piece (the king) on the board.
+    """
+    def _solo_next_states(self, state):
+        return state.get_solo_legal_moves()
+    
     def solve_dfs(self, initial_state):
-        """Pure DFS: stack, visited set. Goal checked when expanding (faster than on every child)."""
-        stack = [initial_state]
-        visited = {initial_state.state_key()}
-        while stack:
-            curr = stack.pop()
-            if curr.is_goal():
-                return self.get_solution_path(curr)
-            for child in curr.get_solo_legal_moves():
-                key = child.state_key()
-                if key not in visited:
-                    visited.add(key)
-                    stack.append(child)
-        return None
+        return dfs(initial_state, self._solo_next_states)
 
     def solve_astar(self, initial_state):
-        """Pure A*: f = g + h, admissible h. Tie-break: more-central first, then LIFO. Single-pass h+c."""
-        h0, c0 = self._h_and_center(initial_state)
-        push_order = 0
-        open_set = [(h0, h0, c0, -push_order, initial_state)]
-        push_order += 1
-        visited = {initial_state.state_key()}
-        while open_set:
-            _, _, _, _, curr = heapq.heappop(open_set)
-            if curr.is_goal():
-                return self.get_solution_path(curr)
-            for child in curr.get_solo_legal_moves():
-                key = child.state_key()
-                if key not in visited:
-                    visited.add(key)
-                    h, c = self._h_and_center(child)
-                    f = child.g + h
-                    heapq.heappush(open_set, (f, h, c, -push_order, child))
-                    push_order += 1
-        return None
+        return astar(initial_state, self._solo_next_states)
 
     def solve_with_metrics(self, initial_state, algorithm='dfs'):
         tracemalloc.start()
         t0 = time.perf_counter()
-        visited = {initial_state.state_key()}
-        nodes_explored = 0
-        solution_found = False
-        path_length = 0
+        tracked_metrics = [0, False, 0] # [nodes_explored, solution_found, path_length]
 
         if algorithm == 'dfs':
-            stack = [initial_state]
-            while stack:
-                curr = stack.pop()
-                nodes_explored += 1
-                if curr.is_goal():
-                    solution_found = True
-                    path_length = len(self.get_solution_path(curr)) - 1
-                    break
-                for child in curr.get_solo_legal_moves():
-                    key = child.state_key()
-                    if key not in visited:
-                        visited.add(key)
-                        stack.append(child)
+            dfs(initial_state, self._solo_next_states, with_metrics=True, tracked_metrics=tracked_metrics)
         else:
-            h0, c0 = self._h_and_center(initial_state)
-            push_order = 0
-            open_set = [(h0, h0, c0, -push_order, initial_state)]
-            push_order += 1
-            while open_set:
-                _, _, _, _, curr = heapq.heappop(open_set)
-                nodes_explored += 1
-                if curr.is_goal():
-                    solution_found = True
-                    path_length = len(self.get_solution_path(curr)) - 1
-                    break
-                for child in curr.get_solo_legal_moves():
-                    key = child.state_key()
-                    if key not in visited:
-                        visited.add(key)
-                        h, c = self._h_and_center(child)
-                        f = child.g + h
-                        heapq.heappush(open_set, (f, h, c, -push_order, child))
-                        push_order += 1
+            astar(initial_state, self._solo_next_states, with_metrics=True, tracked_metrics=tracked_metrics)
 
         t1 = time.perf_counter()
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         return {
             'algorithm': algorithm,
-            'success': solution_found,
+            'success': tracked_metrics[1],
             'time_sec': t1 - t0,
             'memory_peak_mb': peak / (1024 * 1024),
-            'nodes_explored': nodes_explored,
-            'path_length': path_length,
+            'nodes_explored': tracked_metrics[0],
+            'path_length': tracked_metrics[2],
         }
         
 # --- Load .fen data file ---
 def _default_ranger_fen_path():
-    v4_dir = os.path.dirname(os.path.abspath(__file__))
-    p = os.path.join(v4_dir, "chess-ranger-boards.fen")
+    v5_dir = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(v5_dir, "chess-ranger-boards.fen")
     if os.path.isfile(p):
         return p
-    v4_path = os.path.join(os.path.dirname(v4_dir), "v4", "chess-ranger-boards.fen")
-    return v4_path if os.path.isfile(v4_path) else p
+    v5_path = os.path.join(os.path.dirname(v5_dir), "v5", "chess-ranger-boards.fen")
+    return v5_path if os.path.isfile(v5_path) else p
 
 
 def _default_melee_fen_path():
-    v4_dir = os.path.dirname(os.path.abspath(__file__))
-    p = os.path.join(v4_dir, "chess-melee-boards.fen")
+    v5_dir = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(v5_dir, "chess-melee-boards.fen")
     if os.path.isfile(p):
         return p
-    v4_path = os.path.join(os.path.dirname(v4_dir), "v4", "chess-melee-boards.fen")
-    return v4_path if os.path.isfile(v4_path) else p
+    v5_path = os.path.join(os.path.dirname(v5_dir), "v5", "chess-melee-boards.fen")
+    return v5_path if os.path.isfile(v5_path) else p
 
 def _default_solo_fen_path():
-    v4_dir = os.path.dirname(os.path.abspath(__file__))
-    p = os.path.join(v4_dir, "solo-chess-boards.fen")
+    v5_dir = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(v5_dir, "solo-chess-boards.fen")
     if os.path.isfile(p):
         return p
-    v4_path = os.path.join(os.path.dirname(v4_dir), "v4", "solo-chess-boards.fen")
-    return v4_path if os.path.isfile(v4_path) else p
+    v5_path = os.path.join(os.path.dirname(v5_dir), "v5", "solo-chess-boards.fen")
+    return v5_path if os.path.isfile(v5_path) else p
 
 def load_ranger_fen_file(path=None):
     path = path or _default_ranger_fen_path()
@@ -691,13 +484,12 @@ def run_benchmark(scenarios=None, use_random=0, solver_obj=None):
             succ = sum(1 for r in subset if r['success'])
             n = len(subset)
             print(f"AVERAGE ({algo.upper():<5}) | success {succ}/{n} | time {sum(r['time_sec'] for r in subset)/n:.6f} s | memory {sum(r['memory_peak_mb'] for r in subset)/n:.6f} MB | nodes {sum(r['nodes_explored'] for r in subset)/n:.0f} | steps {sum(r['path_length'] for r in subset)/n:.1f}")
-        # Print averages, but only for scenarios in index 701 to 800 inclusive
+        # Print averages, but only for scenarios in index 701 to 800
         if len(scenarios) >= 700:
             print("\nAverages for scenarios 701–800 only (11-piece boards):")
             selected_indices = range(700, 800)  # python 0-based
             selected_results = []
             for idx in selected_indices:
-                # Each scenario spawns two results (DFS and ASTAR), so find those in all_results
                 sc_name = scenarios[idx]['name']
                 for algo in ('dfs', 'astar'):
                     for r_name, r_algo, r in all_results:
@@ -712,6 +504,77 @@ def run_benchmark(scenarios=None, use_random=0, solver_obj=None):
                 else:
                     print(f"No results for algorithm {algo} in lines 701–800.")
 
+
+
+
+
+def get_solution_path(end_state):
+        path = []
+        current = end_state
+        while current:
+            path.append(current)
+            current = current.parent
+        return path[::-1]
+
+def heuristic(state):
+    """Admissible: minimum remaining captures = pieces - 1."""
+    return len(state.pieces) - 1
+
+def heuristic_h_and_center(state):
+    """Single pass: (h, center_sum) for A* and tie-breaking. Avoids two iterations over pieces."""
+    n = len(state.pieces)
+    h = n - 1
+    c = sum(abs(p.row - 3.5) + abs(p.col - 3.5) for p in state.pieces)
+    return h, c
+    
+def dfs(initial_state, next_states_fn, with_metrics=False, tracked_metrics=None):
+    # tracked_metrics = [nodes_explored, solution_found, path_length] = [0, False, 0]
+    stack = [initial_state]
+    visited = {initial_state.state_key()}
+    while stack:
+        if with_metrics:
+            tracked_metrics[0] += 1
+        curr = stack.pop()
+        if curr.is_goal():
+            path = get_solution_path(curr)
+            if with_metrics:
+                tracked_metrics[1] = True
+                tracked_metrics[2] = len(path) - 1
+            return path
+        for child in next_states_fn(curr):
+            key = child.state_key()
+            if key not in visited:
+                visited.add(key)
+                stack.append(child)
+    return None
+
+def astar(initial_state, next_states_fn, with_metrics=False, tracked_metrics=None):
+    # tracked_metrics = [nodes_explored, solution_found, path_length] = [0, False, 0]
+    h0, c0 = heuristic_h_and_center(initial_state)
+    push_order = 0
+    open_set = [(h0, h0, c0, -push_order, initial_state)]
+    push_order += 1
+    visited = {initial_state.state_key()}
+    while open_set:
+        if with_metrics:
+            tracked_metrics[0] += 1
+        _, _, _, _, curr = heapq.heappop(open_set)
+        if curr.is_goal():
+            path = get_solution_path(curr)
+            if with_metrics:
+                tracked_metrics[1] = True
+                tracked_metrics[2] = len(path) - 1
+            return path
+        for child in next_states_fn(curr):
+            key = child.state_key()
+            if key not in visited:
+                visited.add(key)
+                h, c = heuristic_h_and_center(child)
+                f = child.g + h
+                heapq.heappush(open_set, (f, h, c, -push_order, child))
+                push_order += 1
+    return None
+
 # --- Main ---
 def main():
     ranger_solver = RangerSolver()
@@ -722,10 +585,10 @@ def main():
         'melee': melee_solver,
         'solo': solo_solver,
     }
-    default_url = "https://www.puzzle-chess.com/chess-ranger-4/"
+    default_url = "https://www.puzzle-chess.com/chess-ranger-4/?e=MDoxMSw0NjMsNjM1"
 
     while True:
-        print("\n--- Solitaire Chess Solver v4 (pure DFS + A*) ---")
+        print("\n--- Solitaire Chess Solver v5 (pure DFS + A*) ---")
         print("1) Solve from URL (fetch puzzle-chess.com)")
         print("2) Solve 1 random board from ranger .fen file")
         print("3) Solve 1 random board from melee .fen file")
@@ -739,15 +602,16 @@ def main():
             break
 
         if choice == '1':
+            # Fetch a board from puzzle-chess.com (Ranger / Solo / Melee) and solve it.
             try:
-                sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "v2"))
                 from fetch_puzzle_chess import fetch_board_from_url
             except ImportError:
-                print("Option 1 requires v2/fetch_puzzle_chess.py (and playwright).", file=sys.stderr)
+                print("Option 1 requires v5/fetch_puzzle_chess.py (and playwright).", file=sys.stderr)
                 continue
-            url = input(f"URL [{default_url}]: ").strip() or default_url
+            print("Click Share button, copy the link in 'Embed URL:' and paste it here")
+            url = input(f"Example URL [{default_url}]: ").strip() or default_url
             print("Fetching...", file=sys.stderr)
-            fen = fetch_board_from_url(url)
+            fen, count = fetch_board_from_url(url)
             if not fen:
                 print("Failed to fetch board.", file=sys.stderr)
                 continue
@@ -758,7 +622,16 @@ def main():
                 continue
             state = BoardState(pieces)
             print(f"FEN: {fen}\nPieces: {len(pieces)} — {pieces}")
-            path = solver[choice].solve_astar(state)
+
+            url_lower = url.lower()
+            if "solo-chess" in url_lower:
+                solver_obj = solo_solver
+            elif "chess-melee" in url_lower or "melee" in url_lower:
+                solver_obj = melee_solver
+            else:
+                solver_obj = ranger_solver
+
+            path = solver_obj.solve_astar(state)
             if path:
                 print("Solution: YES.", f"Steps: {len(path)-1}")
                 for i, s in enumerate(path):
