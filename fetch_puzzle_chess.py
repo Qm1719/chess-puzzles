@@ -1,8 +1,9 @@
 """
 Fetch a Chess Ranger / Solo Chess board from puzzle-chess.com and return FEN.
 
-Differences from v1: consolidate all scraping strategies into a single script, add Playwright-based loading of
-  puzzle-chess.com, and emit boards in a simple FEN list file to feed the v2 solver and benchmarks.
+Differences from v2: keep the same overall scraping approach but refine the DOM/JavaScript extraction strategies,
+  improve robustness for multiple board layouts, and standardize the output file so it can be reused across solver
+  versions and modes.
 
 Usage:
   pip install playwright
